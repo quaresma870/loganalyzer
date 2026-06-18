@@ -168,11 +168,11 @@ PYTHONPATH=. pytest tests/ -v
 ## Changelog
 
 ### v1.0.1
-- fix: watch mode now detects log rotation via inode change — closes #2
-- feat: `--alert-webhook URL` on `watch` command — POSTs JSON on error entries — closes #3
-- feat: `--tail N` on `analyze` — only process last N lines — closes #1 (partial)
-- feat: `--db path` on `analyze` — persists results to SQLite — closes #4
-- feat: `loganalyzer history <db>` — shows historical runs with error rates
+- fix: watch mode detects log rotation via inode change — closes #2
+- feat: `--alert-webhook URL` — POSTs JSON payload on ERROR/CRITICAL entries — closes #3
+- feat: `--tail N` — analyse only last N lines — closes #1 (partial)
+- feat: `--db path` — persist results to SQLite — closes #4
+- feat: `loganalyzer history <db>` — historical runs with error rates — closes #4
 
 ---
 
