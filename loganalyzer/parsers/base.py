@@ -1,5 +1,6 @@
 """
 Base parser — all parsers extend this class.
+Parsing is generator-based for constant-memory processing of large files.
 """
 
 from __future__ import annotations
@@ -17,7 +18,10 @@ class BaseParser(ABC):
     name: str = "base"
 
     def parse_file(self, path: str | Path) -> Iterator[LogEntry]:
-        """Parse a log file line by line."""
+        """
+        Parse a log file line by line — constant memory regardless of file size.
+        Uses a generator so callers can process entries one at a time.
+        """
         path = Path(path)
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -46,7 +50,7 @@ class BaseParser(ABC):
 
     @staticmethod
     def _safe_int(value: str | None) -> int | None:
-        if value is None or value == "-":
+        if value in (None, "-", ""):
             return None
         try:
             return int(value)

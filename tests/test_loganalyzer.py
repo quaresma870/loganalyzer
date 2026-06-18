@@ -259,3 +259,149 @@ class TestLogEntry:
         e = LogEntry(source="nginx", raw="", timestamp=datetime(2024, 10, 10, 14, 30))
         assert e.hour == 14
         assert e.weekday == "Thursday"
+
+
+# ── Streaming / tail ──────────────────────────────────────────────────────────
+
+class TestStreaming:
+    def test_tail_uses_deque(self):
+        """--tail should only keep last N entries."""
+        import tempfile
+
+        from loganalyzer.parsers.nginx import NginxParser
+
+        lines = []
+        for i in range(100):
+            lines.append(
+                f'192.168.1.{i % 256} - - [10/Oct/2024:13:55:{i:02d} +0000] '
+                f'"GET /path HTTP/1.1" 200 100 "-" "-"'
+            )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write("\n".join(lines))
+            path = f.name
+
+        from collections import deque
+        buf: deque = deque(maxlen=10)
+        parser = NginxParser()
+        for entry in parser.parse_file(path):
+            buf.append(entry)
+
+        assert len(buf) == 10  # only last 10 kept
+
+    def test_parse_file_is_generator(self):
+        """parse_file must return an iterator, not a list."""
+        import tempfile
+
+        from loganalyzer.parsers.nginx import NginxParser
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            f.write('192.168.1.1 - - [10/Oct/2024:13:55:36 +0000] "GET / HTTP/1.1" 200 100\n')
+            path = f.name
+
+        result = NginxParser().parse_file(path)
+        assert hasattr(result, "__iter__")
+        assert hasattr(result, "__next__")  # is a generator/iterator
+
+
+# ── Windows Event Log parser ──────────────────────────────────────────────────
+
+WINDOWS_XML_SINGLE = """<?xml version="1.0" encoding="UTF-8"?>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <EventID>4625</EventID>
+    <Level>4</Level>
+    <TimeCreated SystemTime="2024-10-10T13:55:36.000000Z"/>
+    <Channel>Security</Channel>
+  </System>
+  <EventData>
+    <Data Name="IpAddress">10.0.0.5</Data>
+    <Data Name="TargetUserName">administrator</Data>
+  </EventData>
+</Event>"""
+
+WINDOWS_XML_EVENTS = """<?xml version="1.0" encoding="UTF-8"?>
+<Events>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <EventID>4624</EventID>
+      <Level>4</Level>
+      <TimeCreated SystemTime="2024-10-10T14:00:00.000000Z"/>
+      <Channel>Security</Channel>
+    </System>
+    <EventData><Data Name="IpAddress">192.168.1.10</Data></EventData>
+  </Event>
+  <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+    <System>
+      <EventID>1102</EventID>
+      <Level>4</Level>
+      <TimeCreated SystemTime="2024-10-10T14:05:00.000000Z"/>
+      <Channel>Security</Channel>
+    </System>
+    <EventData></EventData>
+  </Event>
+</Events>"""
+
+
+class TestWindowsEventParser:
+    def setup_method(self):
+        from loganalyzer.parsers.extras import WindowsEventParser
+        self.parser = WindowsEventParser()
+
+    def test_parse_single_event_4625(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(WINDOWS_XML_SINGLE)
+            path = f.name
+        entries = list(self.parser.parse_file(path))
+        assert len(entries) >= 1
+        e = entries[0]
+        assert e.source == "windows_event"
+        assert e.level == "WARNING"  # 4625 = failed logon
+        assert "4625" in e.message
+        assert e.ip == "10.0.0.5"
+
+    def test_parse_events_collection(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(WINDOWS_XML_EVENTS)
+            path = f.name
+        entries = list(self.parser.parse_file(path))
+        assert len(entries) == 2
+        # 1102 = audit log cleared → CRITICAL
+        critical = [e for e in entries if "1102" in e.message]
+        assert critical
+        assert critical[0].level == "CRITICAL"
+
+    def test_registered_in_registry(self):
+        from loganalyzer.parsers import PARSERS
+        assert "windows" in PARSERS
+
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+
+class TestScheduler:
+    def test_parse_cron_every_15min(self):
+        import schedule
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        schedule.clear()
+        job = _parse_cron_to_schedule("*/15 * * * *", lambda: None)
+        assert job is not None
+        schedule.clear()
+
+    def test_parse_cron_daily(self):
+        import schedule
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        schedule.clear()
+        job = _parse_cron_to_schedule("0 6 * * *", lambda: None)
+        assert job is not None
+        schedule.clear()
+
+    def test_invalid_cron_raises(self):
+        import pytest
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        with pytest.raises((ValueError, RuntimeError)):
+            _parse_cron_to_schedule("invalid", lambda: None)

@@ -7,3 +7,5 @@ requests>=2.31.0        # optional: geo lookup
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
 ruff>=0.4.0
+
+schedule>=1.2.0             # --schedule cron mode

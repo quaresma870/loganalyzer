@@ -16,6 +16,7 @@ from loganalyzer.parsers.extras import (
     SSHParser,
     SyslogParser,
     SystemdParser,
+    WindowsEventParser,
 )
 from loganalyzer.parsers.nginx import NginxParser
 
@@ -28,6 +29,7 @@ PARSERS: dict[str, type[BaseParser]] = {
     "fail2ban": Fail2banParser,
     "browser": BrowserConsoleParser,
     "har": HARParser,
+    "windows": WindowsEventParser,
 }
 
 
@@ -47,6 +49,9 @@ def detect_parser(path: str | Path) -> BaseParser:
     name = Path(path).name.lower()
     if name.endswith(".har"):
         return HARParser()
+    if name.endswith(".xml"):
+        # Could be Windows Event Log — check content
+        return WindowsEventParser()
     if name.endswith(".json"):
         return BrowserConsoleParser()
     if "nginx" in name:
