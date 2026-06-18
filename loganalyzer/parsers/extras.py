@@ -384,3 +384,168 @@ class CustomParser(BaseParser):
                    if k not in (self._time_field, self._level_field,
                                 self._ip_field, self._message_field)},
         )
+
+
+# ── Windows Event Log (XML) ───────────────────────────────────────────────────
+# Parses XML exported from Windows Event Viewer or converted from .evtx
+# Also handles evtx2xml / python-evtx output format
+
+_WINDOWS_CRITICAL_IDS = {
+    4625: ("Failed logon attempt", "WARNING"),
+    4648: ("Explicit credentials logon", "WARNING"),
+    4719: ("System audit policy changed", "ERROR"),
+    4720: ("User account created", "INFO"),
+    4722: ("User account enabled", "INFO"),
+    4724: ("Password reset attempt", "WARNING"),
+    4726: ("User account deleted", "WARNING"),
+    4740: ("User account locked out", "WARNING"),
+    4756: ("Member added to security group", "INFO"),
+    4771: ("Kerberos pre-authentication failed", "WARNING"),
+    1102: ("Audit log cleared", "CRITICAL"),
+    7045: ("New service installed", "WARNING"),
+}
+
+_LEVEL_MAP_WIN = {
+    "0": "INFO", "1": "CRITICAL", "2": "ERROR",
+    "3": "WARNING", "4": "INFO", "5": "DEBUG",
+}
+
+
+class WindowsEventParser(BaseParser):
+    """
+    Parses Windows Event Log in XML format.
+    Supports:
+    - Windows Event Viewer XML exports (*.xml with <Events> root)
+    - Single-event XML (one <Event> per line or file)
+    - python-evtx JSON output
+    """
+    name = "windows_event"
+
+    def parse_file(self, path: str | Path) -> Iterator[LogEntry]:
+        import xml.etree.ElementTree as ET
+        path = Path(path)
+        content = path.read_text(encoding="utf-8", errors="replace")
+
+        # Try full XML document first
+        try:
+            root = ET.fromstring(content)
+            ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+            # Handle <Events> wrapper or direct <Event>
+            events = root.findall(".//e:Event", ns) or ([root] if root.tag.endswith("Event") else [])
+            for event in events:
+                entry = self._parse_event(event, ns)
+                if entry:
+                    yield entry
+            return
+        except ET.ParseError:
+            pass
+
+        # Try JSON (python-evtx output)
+        try:
+            data = json.loads(content)
+            if isinstance(data, list):
+                for item in data:
+                    entry = self._parse_json_event(item)
+                    if entry:
+                        yield entry
+            return
+        except json.JSONDecodeError:
+            pass
+
+        # Fall through to line-by-line
+        for line in content.splitlines():
+            entry = self.parse_line(line)
+            if entry:
+                yield entry
+
+    def parse_line(self, line: str) -> LogEntry | None:
+        import xml.etree.ElementTree as ET
+        try:
+            elem = ET.fromstring(line.strip())
+            ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+            return self._parse_event(elem, ns)
+        except ET.ParseError:
+            return None
+
+    def _parse_event(self, event, ns: dict) -> LogEntry | None:
+        try:
+            sys_el = event.find("e:System", ns) or event.find("System")
+            if sys_el is None:
+                return None
+
+            def get(tag):
+                el = sys_el.find(f"e:{tag}", ns) or sys_el.find(tag)
+                return el.text if el is not None else None
+
+            # Try namespaced first, then plain
+            event_id = self._safe_int(get("EventID"))
+            if event_id is None:
+                ei = sys_el.find("{http://schemas.microsoft.com/win/2004/08/events/event}EventID")
+                if ei is None:
+                    ei = sys_el.find("EventID")
+                if ei is not None:
+                    event_id = self._safe_int(ei.text)
+            level_raw = get("Level") or "4"
+            level = _LEVEL_MAP_WIN.get(level_raw, "INFO")
+            ts_raw = get("TimeCreated")
+            ts = None
+            if ts_raw is None:
+                tc = sys_el.find("e:TimeCreated", ns) or sys_el.find("TimeCreated")
+                if tc is not None:
+                    ts_raw = tc.get("SystemTime")
+            if ts_raw:
+                for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+                    try:
+                        ts = datetime.strptime(ts_raw[:26], fmt[:len(fmt)])
+                        break
+                    except ValueError:
+                        continue
+
+            # Known critical event IDs override level
+            description = "Windows event"
+            if event_id and event_id in _WINDOWS_CRITICAL_IDS:
+                description, override_level = _WINDOWS_CRITICAL_IDS[event_id]
+                level = override_level
+
+            # Extract data fields
+            data_el = event.find("e:EventData", ns)
+            if data_el is None:
+                data_el = event.find("EventData")
+            extra = {}
+            ip = None
+            if data_el is not None:
+                for data in data_el:
+                    name = data.get("Name", "")
+                    val = data.text or ""
+                    extra[name] = val
+                    if name in ("IpAddress", "WorkstationName") and val and val != "-":
+                        ip = val.strip().lstrip("\\")
+
+            return LogEntry(
+                source=self.name, raw="",
+                timestamp=ts, level=level, ip=ip,
+                message=f"EventID {event_id}: {description}",
+                extra={"event_id": event_id, "channel": get("Channel"), **extra},
+            )
+        except Exception:
+            return None
+
+    def _parse_json_event(self, obj: dict) -> LogEntry | None:
+        event_id = self._safe_int(str(obj.get("EventID", "")))
+        level = "INFO"
+        description = "Windows event"
+        if event_id and event_id in _WINDOWS_CRITICAL_IDS:
+            description, level = _WINDOWS_CRITICAL_IDS[event_id]
+        ts = None
+        ts_raw = obj.get("TimeCreated") or obj.get("timestamp")
+        if ts_raw:
+            try:
+                ts = datetime.strptime(str(ts_raw)[:19], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                pass
+        return LogEntry(
+            source=self.name, raw=json.dumps(obj),
+            timestamp=ts, level=level,
+            message=f"EventID {event_id}: {description}",
+            extra=obj,
+        )

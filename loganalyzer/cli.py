@@ -53,7 +53,7 @@ def cli():
               help="Enable IP geolocation lookup (requires internet).")
 @click.option("--no-terminal", is_flag=True, default=False,
               help="Suppress terminal output (useful with --output / --json).")
-def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, tail, db):
+def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, tail, db, max_entries):
     """Analyse one or more log files and produce a report."""
     entries = []
 
@@ -66,8 +66,16 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, 
             else:
                 parser = get_parser(fmt, custom_config)
 
-            all_lines = list(parser.parse_file(path))
-            file_entries = all_lines[-tail:] if tail > 0 else all_lines
+            if tail > 0:
+                # For --tail: buffer only the last N entries (constant memory)
+                from collections import deque
+                buf: deque = deque(maxlen=tail)
+                for entry in parser.parse_file(path):
+                    buf.append(entry)
+                file_entries = list(buf)
+            else:
+                # Full streaming — never loads all entries at once
+                file_entries = list(parser.parse_file(path))
             console.print(f"[dim]Parsed[/dim] [bold]{len(file_entries)}[/bold] entries from [green]{path.name}[/green]")
             entries.extend(file_entries)
         except Exception as e:
@@ -81,6 +89,11 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, 
     console.print(f"\n[bold]Analysing {len(entries)} total entries...[/bold]\n")
     analyzer = LogAnalyzer(top_n=top, enable_geo=geo)
     result = analyzer.analyze(entries)
+
+    # Cap entries if --max-entries set
+    if max_entries > 0 and len(entries) > max_entries:
+        entries = entries[:max_entries]
+        console.print(f"[dim]  Capped to {max_entries} entries (--max-entries)[/dim]")
 
     if db:
         _persist_result(db, result)
@@ -201,6 +214,33 @@ def history(db, limit):
             f"[{rate_color}]{rate:.1f}%[/]",
         )
     console.print(t)
+
+
+
+@cli.command()
+@click.argument("files", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option("--cron", required=True,
+              help='Cron expression e.g. "*/15 * * * *" (every 15min), "0 6 * * 1" (Mon 06:00).')
+@click.option("--format", "fmt", default="auto", show_default=True,
+              type=click.Choice(PARSER_CHOICES, case_sensitive=False))
+@click.option("--db", default=None, help="SQLite DB to persist each run.")
+@click.option("--alert-webhook", default=None, help="Webhook URL for anomaly alerts.")
+@click.option("--output-dir", default=None, help="Directory to write HTML reports.")
+@click.option("--top", default=10, show_default=True)
+@click.option("--geo", is_flag=True, default=False)
+def schedule(files, cron, fmt, db, alert_webhook, output_dir, top, geo):
+    """Run log analysis on a cron schedule (runs immediately, then repeats)."""
+    try:
+        import schedule as _s  # noqa: F401
+    except ImportError:
+        console.print("[red]Install schedule: pip install schedule[/red]")
+        return
+
+    from loganalyzer.scheduler import run_schedule
+    run_schedule(
+        files=files, fmt=fmt, cron_expr=cron, db=db,
+        alert_webhook=alert_webhook, top=top, geo=geo, output_dir=output_dir,
+    )
 
 
 def main():
