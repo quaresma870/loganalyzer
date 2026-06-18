@@ -14,7 +14,6 @@ from loganalyzer.parsers.apache import ApacheParser
 from loganalyzer.parsers.extras import Fail2banParser, SSHParser, SystemdParser
 from loganalyzer.parsers.nginx import NginxParser
 
-
 # ── Nginx ─────────────────────────────────────────────────────────────────────
 
 NGINX_ACCESS = (

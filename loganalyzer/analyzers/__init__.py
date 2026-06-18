@@ -9,7 +9,6 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
 
 from loganalyzer.models import LogEntry
 
@@ -157,7 +156,6 @@ class LogAnalyzer:
 
     def _detect_brute_force(self, entries: list[LogEntry]) -> list[dict]:
         """Detect IPs with many failed auth attempts."""
-        fail_events = {"failed", "invalid", "error"}
         ssh_failures: Counter = Counter()
         http_failures: Counter = Counter()
 

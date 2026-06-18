@@ -4,13 +4,10 @@ Terminal output — rich-powered coloured tables and summaries.
 
 from __future__ import annotations
 
-from datetime import datetime
-
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich import box
-from rich.text import Text
 
 from loganalyzer.analyzers import AnalysisResult
 

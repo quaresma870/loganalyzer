@@ -4,10 +4,9 @@ Base parser — all parsers extend this class.
 
 from __future__ import annotations
 
-import re
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 from loganalyzer.models import LogEntry
 
