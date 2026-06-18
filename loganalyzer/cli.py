@@ -15,7 +15,9 @@ import sys
 from pathlib import Path
 
 import click
+from rich import box
 from rich.console import Console
+from rich.table import Table
 
 from loganalyzer.analyzers import LogAnalyzer
 from loganalyzer.output.html_output import write_html
@@ -51,7 +53,7 @@ def cli():
               help="Enable IP geolocation lookup (requires internet).")
 @click.option("--no-terminal", is_flag=True, default=False,
               help="Suppress terminal output (useful with --output / --json).")
-def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal):
+def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, tail, db):
     """Analyse one or more log files and produce a report."""
     entries = []
 
@@ -64,7 +66,8 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal):
             else:
                 parser = get_parser(fmt, custom_config)
 
-            file_entries = list(parser.parse_file(path))
+            all_lines = list(parser.parse_file(path))
+            file_entries = all_lines[-tail:] if tail > 0 else all_lines
             console.print(f"[dim]Parsed[/dim] [bold]{len(file_entries)}[/bold] entries from [green]{path.name}[/green]")
             entries.extend(file_entries)
         except Exception as e:
@@ -78,6 +81,9 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal):
     console.print(f"\n[bold]Analysing {len(entries)} total entries...[/bold]\n")
     analyzer = LogAnalyzer(top_n=top, enable_geo=geo)
     result = analyzer.analyze(entries)
+
+    if db:
+        _persist_result(db, result)
 
     if not no_terminal:
         title = f"{files[0]} ({len(files)} files)" if len(files) > 1 else str(files[0])
@@ -101,14 +107,14 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal):
               help="YAML config for custom parser.")
 @click.option("--interval", default=0.5, show_default=True,
               help="Poll interval in seconds.")
-def watch(file, fmt, custom_config, interval):
+def watch(file, fmt, custom_config, interval, alert_webhook):
     """Watch a log file in real time (tail -f equivalent with parsing)."""
     path = Path(file)
     if fmt == "auto":
         parser = detect_parser(path)
     else:
         parser = get_parser(fmt, custom_config)
-    watch_file(path, parser, interval=interval)
+    watch_file(path, parser, interval=interval, alert_webhook=alert_webhook)
 
 
 @cli.command(name="list-parsers")
@@ -130,6 +136,71 @@ def list_parsers():
     for name, desc in descriptions.items():
         console.print(f"  [cyan]{name:<12}[/cyan] {desc}")
     console.print()
+
+
+
+def _persist_result(db_path: str, result) -> None:
+    """Persist analysis result to SQLite."""
+    import json
+    import sqlite3
+    from datetime import datetime
+    conn = sqlite3.connect(db_path)
+    conn.execute("""CREATE TABLE IF NOT EXISTS runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target TEXT, timestamp TEXT, score_placeholder INTEGER,
+        total INTEGER, errors INTEGER, warnings INTEGER,
+        error_rate REAL, duration_ms REAL, sources TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER, plugin TEXT, title TEXT, severity TEXT,
+        file TEXT, line INTEGER, message TEXT
+    )""")
+    cur = conn.execute(
+        "INSERT INTO runs (target, timestamp, score_placeholder, total, errors, warnings, error_rate, duration_ms, sources) VALUES (?,?,?,?,?,?,?,?,?)",
+        (result.target, result.start_time.isoformat() if result.start_time else datetime.utcnow().isoformat(),
+         0, result.total, result.errors, result.warnings,
+         result.error_rate, 0, json.dumps(result.sources))
+    )
+    run_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    console.print(f"[green]✔[/green] Results saved to [bold]{db_path}[/bold] (run #{run_id})")
+
+
+@cli.command()
+@click.argument("db", type=click.Path(exists=True))
+@click.option("--limit", default=10, show_default=True, help="Number of recent runs to show.")
+def history(db, limit):
+    """Show historical analysis runs from a SQLite database."""
+    import sqlite3
+    conn = sqlite3.connect(db)
+    rows = conn.execute(
+        "SELECT id, target, timestamp, total, errors, error_rate FROM runs ORDER BY id DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print("[yellow]No runs recorded yet.[/yellow]")
+        return
+
+    t = Table(title=f"Last {len(rows)} runs", box=box.SIMPLE_HEAD)
+    t.add_column("#", width=5)
+    t.add_column("Target", overflow="fold")
+    t.add_column("Timestamp")
+    t.add_column("Total", justify="right")
+    t.add_column("Errors", justify="right")
+    t.add_column("Error rate", justify="right")
+    for row in rows:
+        run_id, target, ts, total, errors, rate = row
+        rate_color = "red" if (rate or 0) > 10 else "green"
+        t.add_row(
+            str(run_id), target, ts[:19],
+            str(total), f"[red]{errors}[/red]",
+            f"[{rate_color}]{rate:.1f}%[/]",
+        )
+    console.print(t)
 
 
 def main():
