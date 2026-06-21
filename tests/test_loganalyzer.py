@@ -377,6 +377,110 @@ class TestWindowsEventParser:
         from loganalyzer.parsers import PARSERS
         assert "windows" in PARSERS
 
+    def test_timestamp_is_extracted_not_lost(self):
+        """Regression test: ElementTree elements are falsy when they have
+        zero child elements (EventID/Level/TimeCreated/Channel all are) —
+        using `a.find(x) or a.find(y)` to chain a namespaced lookup with a
+        plain-tag fallback silently discarded every correctly-found leaf
+        element and fell through to the (failing) fallback. timestamp came
+        back None for every Windows event regardless of the source XML,
+        despite TimeCreated's SystemTime attribute being right there."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(WINDOWS_XML_SINGLE)
+            path = f.name
+        entries = list(self.parser.parse_file(path))
+        e = entries[0]
+        assert e.timestamp is not None
+        assert e.timestamp == datetime(2024, 10, 10, 13, 55, 36)
+        assert e.timestamp.tzinfo is None  # naive, consistent with every other parser
+
+    def test_channel_extra_field_is_extracted_not_lost(self):
+        """Same root cause as the timestamp regression above, different
+        field — extra['channel'] also came back None for every event."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(WINDOWS_XML_SINGLE)
+            path = f.name
+        entries = list(self.parser.parse_file(path))
+        assert entries[0].extra.get("channel") == "Security"
+
+    def test_no_deprecation_warning_on_parse(self):
+        """The truthiness bug specifically triggers Python's own
+        'Testing an element's truth value' DeprecationWarning on every
+        single parse call — confirms it's gone, not just suppressed."""
+        import tempfile
+        import warnings
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(WINDOWS_XML_SINGLE)
+            path = f.name
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            list(self.parser.parse_file(path))  # must not raise
+
+
+# ── Browser console JSON logs ───────────────────────────────────────────────────
+
+class TestBrowserConsoleParser:
+    def setup_method(self):
+        from loganalyzer.parsers.extras import BrowserConsoleParser
+        self.parser = BrowserConsoleParser()
+
+    def test_parses_basic_fields(self):
+        import json
+        line = json.dumps({
+            "level": "error", "timestamp": "2024-10-10T13:55:36.123Z",
+            "message": "Uncaught TypeError", "url": "/app.js",
+        })
+        e = self.parser.parse_line(line)
+        assert e is not None
+        assert e.level == "ERROR"
+        assert e.message == "Uncaught TypeError"
+
+    def test_timestamp_with_milliseconds_and_z_suffix(self):
+        """Regression test: the previous manual strptime() loop sliced
+        the JSON's timestamp string to a fixed 19 characters while still
+        requiring formats with a literal trailing 'Z' — which never
+        matched, since the slice always cut the 'Z' off first. This is
+        the most common real-world shape (e.g. JS's
+        `new Date().toISOString()`), so timestamp came back None for
+        essentially every browser console log line in practice."""
+        import json
+        line = json.dumps({"level": "error", "timestamp": "2024-10-10T13:55:36.123Z", "message": "x"})
+        e = self.parser.parse_line(line)
+        assert e.timestamp is not None
+        assert e.timestamp == datetime(2024, 10, 10, 13, 55, 36, 123000)
+        assert e.timestamp.tzinfo is None
+
+    def test_timestamp_without_milliseconds(self):
+        import json
+        line = json.dumps({"level": "info", "timestamp": "2024-10-10T13:55:36Z", "message": "x"})
+        e = self.parser.parse_line(line)
+        assert e.timestamp == datetime(2024, 10, 10, 13, 55, 36)
+
+    def test_timestamp_space_separated_fallback(self):
+        import json
+        line = json.dumps({"level": "info", "timestamp": "2024-10-10 13:55:36", "message": "x"})
+        e = self.parser.parse_line(line)
+        assert e.timestamp == datetime(2024, 10, 10, 13, 55, 36)
+
+    def test_missing_timestamp_is_none_not_an_error(self):
+        import json
+        line = json.dumps({"level": "info", "message": "no timestamp field at all"})
+        e = self.parser.parse_line(line)
+        assert e is not None
+        assert e.timestamp is None
+
+    def test_malformed_timestamp_does_not_raise(self):
+        import json
+        line = json.dumps({"level": "info", "timestamp": "not-a-real-timestamp", "message": "x"})
+        e = self.parser.parse_line(line)
+        assert e is not None
+        assert e.timestamp is None
+
+    def test_invalid_json_returns_none(self):
+        assert self.parser.parse_line("not valid json {{{") is None
+
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 

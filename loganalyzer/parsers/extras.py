@@ -242,12 +242,16 @@ class BrowserConsoleParser(BaseParser):
         ts = None
         ts_raw = obj.get("timestamp") or obj.get("time")
         if ts_raw:
-            for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    ts = datetime.strptime(str(ts_raw)[:19], fmt[:len(fmt)])
-                    break
-                except ValueError:
-                    continue
+            # See WindowsEventParser._parse_event for why fromisoformat()
+            # replaces the previous manual strptime() loop here: the old
+            # code sliced data to a fixed 19 characters while still
+            # requiring formats with a literal trailing 'Z', which never
+            # actually matched an ISO8601-with-Z timestamp (the most common
+            # real-world shape here, e.g. JS's `new Date().toISOString()`).
+            try:
+                ts = datetime.fromisoformat(str(ts_raw)).replace(tzinfo=None)
+            except ValueError:
+                ts = None
         return LogEntry(
             source=self.name, raw=str(raw), timestamp=ts, level=level,
             path=obj.get("url") or obj.get("source"),
@@ -467,14 +471,31 @@ class WindowsEventParser(BaseParser):
         except ET.ParseError:
             return None
 
+    @staticmethod
+    def _find_ns_or_plain(parent, tag: str, ns: dict):
+        """Try a namespaced find() first, falling back to a plain tag name.
+
+        ElementTree elements are falsy in a boolean context whenever they
+        have zero CHILD elements — which describes nearly every meaningful
+        single-value field in Windows Event Log XML (EventID, Level,
+        TimeCreated, Channel are all leaf elements). The natural-looking
+        `parent.find(a) or parent.find(b)` pattern silently discards a
+        correctly-found leaf element and falls through to the second
+        lookup, which is wrong. Always check `is not None` explicitly.
+        """
+        found = parent.find(f"e:{tag}", ns)
+        if found is not None:
+            return found
+        return parent.find(tag)
+
     def _parse_event(self, event, ns: dict) -> LogEntry | None:
         try:
-            sys_el = event.find("e:System", ns) or event.find("System")
+            sys_el = self._find_ns_or_plain(event, "System", ns)
             if sys_el is None:
                 return None
 
             def get(tag):
-                el = sys_el.find(f"e:{tag}", ns) or sys_el.find(tag)
+                el = self._find_ns_or_plain(sys_el, tag, ns)
                 return el.text if el is not None else None
 
             # Try namespaced first, then plain
@@ -490,16 +511,24 @@ class WindowsEventParser(BaseParser):
             ts_raw = get("TimeCreated")
             ts = None
             if ts_raw is None:
-                tc = sys_el.find("e:TimeCreated", ns) or sys_el.find("TimeCreated")
+                tc = self._find_ns_or_plain(sys_el, "TimeCreated", ns)
                 if tc is not None:
                     ts_raw = tc.get("SystemTime")
             if ts_raw:
-                for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-                    try:
-                        ts = datetime.strptime(ts_raw[:26], fmt[:len(fmt)])
-                        break
-                    except ValueError:
-                        continue
+                # datetime.fromisoformat() (3.11+) natively handles the
+                # trailing 'Z' and variable-precision fractional seconds —
+                # the previous manual strptime() here sliced the trailing
+                # 'Z' off the data (ts_raw[:26]) while still requiring a
+                # literal 'Z' in the format string, so it never actually
+                # matched anything and silently produced no timestamp at
+                # all. .replace(tzinfo=None) keeps this naive, matching
+                # every other parser in this codebase — mixing naive and
+                # aware datetimes raises TypeError the moment two entries
+                # from different sources are sorted/compared together.
+                try:
+                    ts = datetime.fromisoformat(ts_raw).replace(tzinfo=None)
+                except ValueError:
+                    ts = None
 
             # Known critical event IDs override level
             description = "Windows event"
