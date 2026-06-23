@@ -47,7 +47,13 @@ class NginxParser(BaseParser):
         m = _ACCESS_RE.match(line)
         if m:
             try:
-                ts = datetime.strptime(m.group("time"), _TIME_FMT_ACCESS)
+                # %z in _TIME_FMT_ACCESS produces a timezone-AWARE datetime
+                # (nginx logs the UTC offset, e.g. "+0000") — every other
+                # parser in this codebase produces naive datetimes, and
+                # mixing the two raises TypeError the moment two entries
+                # from different sources are compared (e.g. correlation,
+                # or just sorting a combined list) — strip it to match.
+                ts = datetime.strptime(m.group("time"), _TIME_FMT_ACCESS).replace(tzinfo=None)
             except ValueError:
                 ts = None
             status = self._safe_int(m.group("status"))

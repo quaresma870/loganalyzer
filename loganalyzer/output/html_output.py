@@ -137,6 +137,7 @@ _TEMPLATE = """<!DOCTYPE html>
 <!-- Anomalies & Brute Force -->
 {anomaly_section}
 {brute_force_section}
+{correlation_section}
 {spike_section}
 {geo_section}
 
@@ -297,6 +298,22 @@ def write_html(result: AnalysisResult, path: str | Path, title: str = "Analysis"
         rows += "</table>"
         spike_section = f'<div class="card section"><h2>📈 Error Spikes</h2>{rows}</div>'
 
+    correlation_section = ""
+    if result.correlations:
+        rows = ('<table><tr><th>IP</th><th>SSH failures</th><th>HTTP 4xx/error</th>'
+                '<th>Closest gap</th><th>Severity</th></tr>')
+        for c in result.correlations:
+            sev = c["severity"].lower()
+            rows += (f'<tr><td>{c["ip"]}</td><td>{c["ssh_event_count"]}</td>'
+                     f'<td>{c["http_event_count"]}</td><td>{c["closest_gap_minutes"]} min</td>'
+                     f'<td><span class="badge {sev}">{c["severity"]}</span></td></tr>')
+        rows += "</table>"
+        correlation_section = (
+            f'<div class="card section"><h2>🔗 Cross-Source Correlation</h2>'
+            f'<p style="opacity:0.7">IPs with suspicious activity across more than one log source '
+            f'within a short time window.</p>{rows}</div>'
+        )
+
     geo_section = ""
     if result.geo:
         rows = '<table><tr><th>IP</th><th>Country</th><th>City</th><th>ISP</th></tr>'
@@ -323,6 +340,7 @@ def write_html(result: AnalysisResult, path: str | Path, title: str = "Analysis"
         top_path_rows=top_path_rows,
         anomaly_section=anomaly_section,
         brute_force_section=brute_force_section,
+        correlation_section=correlation_section,
         spike_section=spike_section,
         geo_section=geo_section,
         timeline_section=timeline_section,

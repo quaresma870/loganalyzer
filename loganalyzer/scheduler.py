@@ -68,6 +68,7 @@ def run_schedule(
     top: int,
     geo: bool,
     output_dir: str | None,
+    geo_db: str | None = None,
 ) -> None:
     """Run log analysis on a cron schedule until Ctrl+C."""
     try:
@@ -94,7 +95,7 @@ def run_schedule(
             console.print("[yellow]No entries parsed.[/yellow]")
             return
 
-        analyzer = LogAnalyzer(top_n=top, enable_geo=geo)
+        analyzer = LogAnalyzer(top_n=top, enable_geo=geo or bool(geo_db), geo_db_path=geo_db)
         result = analyzer.analyze(entries)
         print_summary(result)
 

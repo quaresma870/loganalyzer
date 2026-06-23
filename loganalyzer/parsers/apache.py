@@ -46,7 +46,10 @@ class ApacheParser(BaseParser):
         m = _ACCESS_RE.match(line)
         if m:
             try:
-                ts = datetime.strptime(m.group("time"), _TIME_FMT_ACCESS)
+                # See nginx.py's parser for why .replace(tzinfo=None) is
+                # needed here — %z makes this datetime timezone-aware,
+                # inconsistent with every other parser's naive datetimes.
+                ts = datetime.strptime(m.group("time"), _TIME_FMT_ACCESS).replace(tzinfo=None)
             except ValueError:
                 ts = None
             status = self._safe_int(m.group("status"))

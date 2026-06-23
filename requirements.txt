@@ -1,11 +1,15 @@
 click>=8.1.0
 rich>=13.7.0
 pyyaml>=6.0.1
-requests>=2.31.0        # optional: geo lookup
+requests>=2.31.0        # optional: geo lookup (live ip-api.com)
+geoip2>=4.8.0           # optional: geo lookup (offline GeoLite2-City.mmdb) — pip install loganalyzer[geoip]
+fastapi>=0.110.0        # optional: web dashboard — pip install loganalyzer[dashboard]
+uvicorn>=0.29.0         # optional: web dashboard server
 
 # Dev / test
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
 ruff>=0.4.0
+httpx2>=2.0.0          # required by starlette.testclient (FastAPI TestClient) — see TestDashboard
 
 schedule>=1.2.0             # --schedule cron mode

@@ -4,10 +4,14 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "loganalyzer"
-version = "1.0.0"
+version = "1.1.0"
 description = "Parse, analyse and report on log files"
 requires-python = ">=3.11"
 dependencies = ["click>=8.1.0", "rich>=13.7.0", "pyyaml>=6.0.1"]
+
+[project.optional-dependencies]
+geoip = ["geoip2>=4.8.0"]
+dashboard = ["fastapi>=0.110.0", "uvicorn>=0.29.0"]
 
 [project.scripts]
 loganalyzer = "loganalyzer.cli:main"

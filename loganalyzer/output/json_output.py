@@ -44,6 +44,7 @@ def to_dict(result: AnalysisResult) -> dict:
             "peak_weekday": result.peak_weekday,
         },
         "geo": result.geo,
+        "correlations": result.correlations,
         "banned_ips": [{"ip": ip, "count": c} for ip, c in result.banned_ips],
         "timeline": result.timeline,
     }
