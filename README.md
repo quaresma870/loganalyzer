@@ -14,12 +14,14 @@ Parse, analyse and report on log files from the command line. Supports multiple 
 - ✅ **Auto-detection** — detects format from filename
 - ✅ **Anomaly detection** — high-volume IPs, scanner detection, error rate spikes
 - ✅ **Brute force detection** — SSH and HTTP auth failures per IP
+- ✅ **Cross-source correlation** — flags IPs with suspicious activity across more than one log source within a configurable time window (e.g. SSH brute-force correlated with nginx 4xx/error activity)
 - ✅ **Temporal patterns** — traffic by hour and weekday
-- ✅ **IP geolocation** — optional lookup via ip-api.com
+- ✅ **IP geolocation** — live lookup via ip-api.com, or fully offline via a local MaxMind GeoLite2 database (`--geo-db`, optional extra)
 - ✅ **3 output formats** — rich terminal, JSON, self-contained HTML report with Chart.js
 - ✅ **Watch mode** — real-time tail with `--watch`
+- ✅ **Web dashboard** — read-only history viewer (`loganalyzer serve --db results.db`), optional extra
 - ✅ **Custom parser** — define any log format via a YAML regex config
-- ✅ **23 tests** — full parser and analyzer coverage
+- ✅ **71 tests** — parsers, analyzers, and CLI command coverage
 
 ---
 
@@ -53,8 +55,29 @@ python -m loganalyzer.cli analyze access.log --json results.json
 # Multiple files at once
 python -m loganalyzer.cli analyze nginx.log apache.log --format auto
 
-# Include IP geolocation (requires internet)
+# Cross-source correlation — flags IPs active across BOTH files within
+# the window (default 10 min); only runs when 2+ sources are present
+python -m loganalyzer.cli analyze auth.log access.log --correlation-window 15
+
+# Include IP geolocation — live API (requires internet, top 20 IPs only,
+# subject to ip-api.com's free-tier rate limit)
 python -m loganalyzer.cli analyze access.log --geo
+
+# Include IP geolocation — offline, every IP, no network call, no data sent
+# to a third party. Needs a free MaxMind GeoLite2-City.mmdb file:
+# https://dev.maxmind.com/geoip/geolite2-free-geolocation-data (free account, no payment)
+pip install loganalyzer[geoip]
+python -m loganalyzer.cli analyze access.log --geo-db /path/to/GeoLite2-City.mmdb
+
+# Keep only the last N entries per file (constant memory for huge files)
+python -m loganalyzer.cli analyze huge.log --tail 10000
+
+# Cap the total number of entries analysed
+python -m loganalyzer.cli analyze access.log --max-entries 50000
+
+# Persist this run's results to a SQLite DB, view history later
+python -m loganalyzer.cli analyze access.log --db results.db
+python -m loganalyzer.cli history results.db
 ```
 
 ### Watch mode (real-time)
@@ -62,6 +85,23 @@ python -m loganalyzer.cli analyze access.log --geo
 ```bash
 python -m loganalyzer.cli watch /var/log/nginx/access.log
 python -m loganalyzer.cli watch /var/log/auth.log --format ssh
+```
+
+### Web dashboard
+
+Read-only viewer over your `--db` analysis history — no auth, since nothing
+here mutates state or exposes anything sensitive enough to need it.
+
+```bash
+pip install loganalyzer[dashboard]
+
+# Build up some history first
+python -m loganalyzer.cli analyze access.log --db results.db
+python -m loganalyzer.cli analyze auth.log --db results.db
+
+# Then browse it
+python -m loganalyzer.cli serve --db results.db
+# → http://127.0.0.1:8080  (JSON API at /api/runs, /api/runs/{id})
 ```
 
 ### List available parsers
@@ -122,6 +162,7 @@ Each run produces:
 - **Top IPs** by request volume and error count
 - **HTTP stats** — status codes, methods, paths
 - **Brute force suspects** — IPs exceeding failure thresholds
+- **Cross-source correlation** — IPs flagged across more than one log source within a time window
 - **Anomalies** — high-volume IPs, scanner patterns, high error rates
 - **Error spikes** — time windows where errors exceeded 3× the average
 - **Temporal patterns** — requests by hour and weekday
@@ -145,12 +186,16 @@ loganalyzer/
 │   │   └── extras.py       # systemd, syslog, ssh, fail2ban, browser, har, custom
 │   ├── analyzers/
 │   │   └── __init__.py     # LogAnalyzer + AnalysisResult
+│   ├── dashboard/
+│   │   └── app.py          # Read-only FastAPI dashboard — `loganalyzer serve`
 │   └── output/
 │       ├── terminal.py     # Rich terminal output
 │       ├── json_output.py  # JSON serialiser
 │       └── html_output.py  # Self-contained HTML with Chart.js
 ├── tests/
-│   └── test_loganalyzer.py # 23 tests
+│   ├── test_loganalyzer.py # 71 tests — parsers, analyzers, CLI, dashboard
+│   └── fixtures/
+│       └── GeoLite2-City-Test.mmdb  # MaxMind's own test DB, Apache/MIT licensed
 ├── .github/workflows/ci.yml
 ├── requirements.txt
 └── pyproject.toml

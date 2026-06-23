@@ -8,7 +8,7 @@ import ipaddress
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from loganalyzer.models import LogEntry
 
@@ -50,6 +50,9 @@ class AnalysisResult:
     # Fail2ban
     banned_ips: list[tuple[str, int]] = field(default_factory=list)
 
+    # Cross-source correlation
+    correlations: list[dict] = field(default_factory=list)
+
     # Timeline (for HTML charts)
     timeline: list[dict] = field(default_factory=list)
 
@@ -73,9 +76,19 @@ class LogAnalyzer:
     # Minimum entries per hour-window to consider for spike
     SPIKE_MIN_ENTRIES = 5
 
-    def __init__(self, top_n: int = 10, enable_geo: bool = False):
+    def __init__(self, top_n: int = 10, enable_geo: bool = False, geo_db_path: str | None = None,
+                 correlation_window_minutes: int = 10):
         self.top_n = top_n
         self.enable_geo = enable_geo
+        # Path to a local MaxMind GeoLite2-City.mmdb file. When set, geo
+        # lookups happen offline (no network call, no rate limit, no IPs
+        # sent to a third party, every IP looked up rather than just the
+        # top 20) instead of the live ip-api.com call below.
+        self.geo_db_path = geo_db_path
+        # How close together (in minutes) events from DIFFERENT sources for
+        # the same IP need to be to count as correlated — see
+        # _detect_correlations below.
+        self.correlation_window_minutes = correlation_window_minutes
 
     def analyze(self, entries: list[LogEntry]) -> AnalysisResult:
         result = AnalysisResult()
@@ -143,12 +156,20 @@ class LogAnalyzer:
         )
         result.banned_ips = ban_counter.most_common(self.top_n)
 
+        # Cross-source correlation — only meaningful with more than one source
+        if len(result.sources) > 1:
+            result.correlations = self._detect_correlations(entries)
+
         # Timeline (group by hour)
         result.timeline = self._build_timeline(entries)
 
-        # Geo (optional, requires network)
+        # Geo (optional, offline via a local GeoLite2 DB if configured,
+        # otherwise the live ip-api.com lookup, requires network)
         if self.enable_geo:
-            result.geo = self._lookup_geo([ip for ip, _ in result.top_ips[:20]])
+            if self.geo_db_path:
+                result.geo = self._lookup_geo_offline([ip for ip, _ in result.top_ips], self.geo_db_path)
+            else:
+                result.geo = self._lookup_geo([ip for ip, _ in result.top_ips[:20]])
 
         return result
 
@@ -184,6 +205,69 @@ class LogAnalyzer:
                                  "severity": "HIGH" if count > 50 else "MEDIUM"})
 
         return sorted(results, key=lambda x: x["count"], reverse=True)
+
+    def _detect_correlations(self, entries: list[LogEntry]) -> list[dict]:
+        """Flag IPs with suspicious activity across MORE THAN ONE log
+        source within a short time window — e.g. an SSH brute-force IP
+        that also shows up making 4xx/error requests against nginx shortly
+        before or after. Deliberately narrow in scope for a first pass:
+        only this one pairing (SSH auth failures <-> HTTP 4xx/error), not
+        a general N-source correlation engine. Each source's events need a
+        timestamp to be correlatable at all — entries with no timestamp
+        are silently skipped here, not treated as a match.
+        """
+        window = timedelta(minutes=self.correlation_window_minutes)
+
+        ssh_events: defaultdict = defaultdict(list)
+        http_events: defaultdict = defaultdict(list)
+
+        for e in entries:
+            if not e.ip or not e.timestamp:
+                continue
+            if e.source in ("ssh", "syslog", "systemd") and (
+                e.extra.get("event") == "failed" or (
+                    e.level in ("WARNING", "ERROR") and
+                    any(k in e.message.lower() for k in ("failed", "invalid user", "authentication failure"))
+                )
+            ):
+                ssh_events[e.ip].append(e)
+            if e.status and e.status >= 400:
+                http_events[e.ip].append(e)
+
+        correlated = []
+        for ip in set(ssh_events) & set(http_events):
+            ssh_times = sorted(e.timestamp for e in ssh_events[ip])
+            http_times = sorted(e.timestamp for e in http_events[ip])
+
+            # Two-pointer scan for the closest cross-source pair within window —
+            # avoids an O(n*m) comparison for IPs with many events on both sides.
+            best_gap = None
+            i = j = 0
+            while i < len(ssh_times) and j < len(http_times):
+                gap = abs(ssh_times[i] - http_times[j])
+                if best_gap is None or gap < best_gap:
+                    best_gap = gap
+                if ssh_times[i] < http_times[j]:
+                    i += 1
+                else:
+                    j += 1
+
+            if best_gap is not None and best_gap <= window:
+                correlated.append({
+                    "ip": ip,
+                    "sources": ["ssh", "nginx/apache"],
+                    "ssh_event_count": len(ssh_events[ip]),
+                    "http_event_count": len(http_events[ip]),
+                    "closest_gap_minutes": round(best_gap.total_seconds() / 60, 1),
+                    "description": (
+                        f"{ip}: {len(ssh_events[ip])} SSH auth failure(s) and "
+                        f"{len(http_events[ip])} HTTP 4xx/error request(s), "
+                        f"closest pair {round(best_gap.total_seconds() / 60, 1)} min apart"
+                    ),
+                    "severity": "HIGH" if len(ssh_events[ip]) >= self.BRUTE_FORCE_THRESHOLD else "MEDIUM",
+                })
+
+        return sorted(correlated, key=lambda x: x["closest_gap_minutes"])
 
     def _detect_anomalies(self, entries: list[LogEntry]) -> list[dict]:
         """Detect suspicious patterns."""
@@ -287,6 +371,57 @@ class LogAnalyzer:
                 buckets[key]["warnings"] += 1
 
         return [{"time": k, **v} for k, v in sorted(buckets.items())]
+
+    def _lookup_geo_offline(self, ips: list[str], db_path: str) -> list[dict]:
+        """Lookup geo info for IPs using a local MaxMind GeoLite2-City.mmdb
+        file — no network call, no per-request rate limit, no IPs sent to
+        a third party, and not capped to the top 20 the live API path uses
+        to stay within ip-api.com's free-tier limits.
+
+        Get the free database (requires a free MaxMind account, no
+        payment): https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+        """
+        try:
+            import geoip2.database
+            import geoip2.errors
+        except ImportError:
+            return []
+
+        results = []
+        try:
+            reader = geoip2.database.Reader(db_path)
+        except Exception:
+            # Bad path / corrupt file — degrade gracefully rather than
+            # crashing the whole analysis over an optional enrichment step.
+            return []
+
+        try:
+            for ip in ips:
+                try:
+                    obj = ipaddress.ip_address(ip)
+                    if obj.is_private or obj.is_loopback or obj.is_reserved:
+                        continue
+                except ValueError:
+                    continue
+
+                try:
+                    city = reader.city(ip)
+                except geoip2.errors.AddressNotFoundError:
+                    continue
+                except Exception:
+                    continue
+
+                results.append({
+                    "ip": ip,
+                    "country": city.country.name,
+                    "country_code": city.country.iso_code,
+                    "city": city.city.name,
+                    "isp": None,  # GeoLite2-City doesn't include ISP; that's a separate MaxMind product
+                })
+        finally:
+            reader.close()
+
+        return results
 
     def _lookup_geo(self, ips: list[str]) -> list[dict]:
         """Lookup geo info for IPs using ip-api.com (free, no key needed)."""

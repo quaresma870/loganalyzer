@@ -100,8 +100,14 @@ def print_summary(result: AnalysisResult, title: str = "Log Analysis Report") ->
         t.add_column("Requests", justify="right")
         for day in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]:
             count = result.by_weekday.get(day, 0)
-            style = "bold cyan" if day == result.peak_weekday else ""
-            t.add_row(f"[{style}]{day}[/]", str(count))
+            # An empty style ("") produces an empty Rich markup tag "[]...[/]",
+            # which Rich treats as having no openable tag at all — the
+            # closing "[/]" then has nothing to close and raises
+            # MarkupError on every single non-peak day, i.e. on every
+            # real run with weekday data. Only wrap in markup when there's
+            # an actual style to apply.
+            label = f"[bold cyan]{day}[/]" if day == result.peak_weekday else day
+            t.add_row(label, str(count))
         console.print(t)
 
     # ── Brute force ───────────────────────────────────────────────────────────
@@ -127,6 +133,23 @@ def print_summary(result: AnalysisResult, title: str = "Log Analysis Report") ->
             sev = a.get("severity", "LOW")
             color = "red" if sev == "HIGH" else "yellow"
             t.add_row(a["type"], a["description"], f"[{color}]{sev}[/]")
+        console.print(t)
+
+    # ── Cross-source correlation ─────────────────────────────────────────────
+    if result.correlations:
+        t = Table(title="⚠  Cross-Source Correlation", box=box.SIMPLE_HEAD, border_style="red")
+        t.add_column("IP")
+        t.add_column("SSH failures", justify="right")
+        t.add_column("HTTP 4xx/error", justify="right")
+        t.add_column("Closest gap", justify="right")
+        t.add_column("Severity")
+        for c in result.correlations:
+            sev = c["severity"]
+            color = "red" if sev == "HIGH" else "yellow"
+            t.add_row(
+                c["ip"], str(c["ssh_event_count"]), str(c["http_event_count"]),
+                f"{c['closest_gap_minutes']} min", f"[{color}]{sev}[/]",
+            )
         console.print(t)
 
     # ── Error spikes ──────────────────────────────────────────────────────────

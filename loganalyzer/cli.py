@@ -31,7 +31,7 @@ PARSER_CHOICES = list(PARSERS.keys()) + ["custom", "auto"]
 
 
 @click.group()
-@click.version_option("1.0.0", prog_name="loganalyzer")
+@click.version_option("1.1.0", prog_name="loganalyzer")
 def cli():
     """📋 LogAnalyzer — parse, analyse and report on log files."""
 
@@ -50,10 +50,23 @@ def cli():
 @click.option("--top", default=10, show_default=True,
               help="Number of top items to show.")
 @click.option("--geo", is_flag=True, default=False,
-              help="Enable IP geolocation lookup (requires internet).")
+              help="Enable IP geolocation lookup (requires internet, unless --geo-db is set).")
+@click.option("--geo-db", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Path to a local MaxMind GeoLite2-City.mmdb file — looks up every IP "
+                   "offline instead of the top 20 via the live ip-api.com call. Implies --geo.")
 @click.option("--no-terminal", is_flag=True, default=False,
               help="Suppress terminal output (useful with --output / --json).")
-def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, tail, db, max_entries):
+@click.option("--tail", default=0, show_default=True,
+              help="Keep only the last N parsed entries per file (constant memory). 0 = disabled.")
+@click.option("--db", default=None, type=click.Path(),
+              help="SQLite DB to persist this run's results.")
+@click.option("--max-entries", default=0, show_default=True,
+              help="Cap the total number of entries analysed across all files. 0 = unlimited.")
+@click.option("--correlation-window", default=10, show_default=True,
+              help="Minutes within which SSH-failure and HTTP 4xx/error events from the same "
+                   "IP across different sources count as correlated. Only runs with 2+ sources.")
+def analyze(files, fmt, custom_config, output, json_out, top, geo, geo_db, no_terminal, tail, db,
+            max_entries, correlation_window):
     """Analyse one or more log files and produce a report."""
     entries = []
 
@@ -87,7 +100,8 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, 
         sys.exit(1)
 
     console.print(f"\n[bold]Analysing {len(entries)} total entries...[/bold]\n")
-    analyzer = LogAnalyzer(top_n=top, enable_geo=geo)
+    analyzer = LogAnalyzer(top_n=top, enable_geo=geo or bool(geo_db), geo_db_path=geo_db,
+                            correlation_window_minutes=correlation_window)
     result = analyzer.analyze(entries)
 
     # Cap entries if --max-entries set
@@ -96,7 +110,7 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, 
         console.print(f"[dim]  Capped to {max_entries} entries (--max-entries)[/dim]")
 
     if db:
-        _persist_result(db, result)
+        _persist_result(db, result, target=", ".join(str(f) for f in files))
 
     if not no_terminal:
         title = f"{files[0]} ({len(files)} files)" if len(files) > 1 else str(files[0])
@@ -120,6 +134,7 @@ def analyze(files, fmt, custom_config, output, json_out, top, geo, no_terminal, 
               help="YAML config for custom parser.")
 @click.option("--interval", default=0.5, show_default=True,
               help="Poll interval in seconds.")
+@click.option("--alert-webhook", default=None, help="Webhook URL for anomaly alerts.")
 def watch(file, fmt, custom_config, interval, alert_webhook):
     """Watch a log file in real time (tail -f equivalent with parsing)."""
     path = Path(file)
@@ -152,28 +167,43 @@ def list_parsers():
 
 
 
-def _persist_result(db_path: str, result) -> None:
-    """Persist analysis result to SQLite."""
+def _persist_result(db_path: str, result, target: str) -> None:
+    """Persist analysis result to SQLite — including the full result as
+    JSON (result_json), which is what the web dashboard (`loganalyzer
+    serve`) reads to render a run's full breakdown (top IPs, brute force,
+    anomalies, correlations, geo, timeline — everything print_summary
+    shows, not just the summary columns already in this table)."""
     import json
     import sqlite3
     from datetime import datetime
+
+    from loganalyzer.output.json_output import to_dict
     conn = sqlite3.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         target TEXT, timestamp TEXT, score_placeholder INTEGER,
         total INTEGER, errors INTEGER, warnings INTEGER,
-        error_rate REAL, duration_ms REAL, sources TEXT
+        error_rate REAL, duration_ms REAL, sources TEXT,
+        result_json TEXT
     )""")
+    # ALTER TABLE for any pre-existing DB created before result_json existed —
+    # SQLite errors on a duplicate column, so check first rather than
+    # try/except-ing a generic OperationalError that could mask something else.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "result_json" not in existing_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN result_json TEXT")
     conn.execute("""CREATE TABLE IF NOT EXISTS findings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         run_id INTEGER, plugin TEXT, title TEXT, severity TEXT,
         file TEXT, line INTEGER, message TEXT
     )""")
     cur = conn.execute(
-        "INSERT INTO runs (target, timestamp, score_placeholder, total, errors, warnings, error_rate, duration_ms, sources) VALUES (?,?,?,?,?,?,?,?,?)",
-        (result.target, result.start_time.isoformat() if result.start_time else datetime.utcnow().isoformat(),
+        "INSERT INTO runs (target, timestamp, score_placeholder, total, errors, warnings, "
+        "error_rate, duration_ms, sources, result_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (target, result.start_time.isoformat() if result.start_time else datetime.utcnow().isoformat(),
          0, result.total, result.errors, result.warnings,
-         result.error_rate, 0, json.dumps(result.sources))
+         result.error_rate, 0, json.dumps(result.sources),
+         json.dumps(to_dict(result), default=str))
     )
     run_id = cur.lastrowid
     conn.commit()
@@ -228,7 +258,9 @@ def history(db, limit):
 @click.option("--output-dir", default=None, help="Directory to write HTML reports.")
 @click.option("--top", default=10, show_default=True)
 @click.option("--geo", is_flag=True, default=False)
-def schedule(files, cron, fmt, db, alert_webhook, output_dir, top, geo):
+@click.option("--geo-db", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Path to a local MaxMind GeoLite2-City.mmdb file. Implies --geo.")
+def schedule(files, cron, fmt, db, alert_webhook, output_dir, top, geo, geo_db):
     """Run log analysis on a cron schedule (runs immediately, then repeats)."""
     try:
         import schedule as _s  # noqa: F401
@@ -239,8 +271,31 @@ def schedule(files, cron, fmt, db, alert_webhook, output_dir, top, geo):
     from loganalyzer.scheduler import run_schedule
     run_schedule(
         files=files, fmt=fmt, cron_expr=cron, db=db,
-        alert_webhook=alert_webhook, top=top, geo=geo, output_dir=output_dir,
+        alert_webhook=alert_webhook, top=top, geo=geo or bool(geo_db), output_dir=output_dir,
+        geo_db=geo_db,
     )
+
+
+@cli.command()
+@click.option("--db", default="results.db", show_default=True,
+              help="SQLite database with analysis history (written via `analyze --db`).")
+@click.option("--host", default="127.0.0.1", show_default=True)
+@click.option("--port", default=8080, show_default=True)
+def serve(db, host, port):
+    """Start the read-only web dashboard for analysis history."""
+    try:
+        import uvicorn
+    except ImportError:
+        console.print("[red]uvicorn is required: pip install loganalyzer[dashboard][/red]")
+        sys.exit(1)
+
+    from loganalyzer.dashboard.app import create_app
+
+    console.print(f"[bold cyan]📋 LogAnalyzer Dashboard[/bold cyan] → http://{host}:{port}")
+    console.print(f"[dim]API docs:[/dim] http://{host}:{port}/docs\n")
+
+    app = create_app(db)
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 def main():
