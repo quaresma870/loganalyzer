@@ -321,6 +321,13 @@ def write_html(result: AnalysisResult, path: str | Path, title: str = "Analysis"
             rows += f'<tr><td>{g["ip"]}</td><td>{g.get("country_code","")} {g.get("country","")}</td><td>{g.get("city","")}</td><td>{g.get("isp","")}</td></tr>'
         rows += "</table>"
         geo_section = f'<div class="card section"><h2>🌍 IP Geolocation</h2>{rows}</div>'
+    elif result.geo_error:
+        # Same reasoning as terminal.py's equivalent branch: geo was
+        # requested but produced nothing, and that must never be silent.
+        geo_section = (
+            f'<div class="card section"><h2>🌍 IP Geolocation</h2>'
+            f'<p style="opacity:0.7">⚠ Unavailable: {result.geo_error}</p></div>'
+        )
 
     timeline_section = _TIMELINE_SECTION if result.timeline else ""
     timeline_js = _TIMELINE_JS if result.timeline else ""

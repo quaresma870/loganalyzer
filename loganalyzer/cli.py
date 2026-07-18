@@ -269,11 +269,26 @@ def schedule(files, cron, fmt, db, alert_webhook, output_dir, top, geo, geo_db):
         return
 
     from loganalyzer.scheduler import run_schedule
-    run_schedule(
-        files=files, fmt=fmt, cron_expr=cron, db=db,
-        alert_webhook=alert_webhook, top=top, geo=geo or bool(geo_db), output_dir=output_dir,
-        geo_db=geo_db,
-    )
+    try:
+        run_schedule(
+            files=files, fmt=fmt, cron_expr=cron, db=db,
+            alert_webhook=alert_webhook, top=top, geo=geo or bool(geo_db), output_dir=output_dir,
+            geo_db=geo_db,
+        )
+    except ValueError as exc:
+        # _parse_cron_to_schedule raises ValueError for a malformed
+        # --cron expression — confirmed by actually passing a garbage
+        # --cron value through the real installed CLI and hitting a raw,
+        # unhandled traceback before this was added.
+        console.print(f"[red]✘ Invalid --cron expression:[/red] {exc}")
+        console.print(
+            "[dim]Supported: '*/N * * * *' (every N minutes), '0 */N * * *' (every N hours), "
+            "'MM HH * * *' (daily at HH:MM), 'MM HH * * D' (weekly, D=0 Mon..6 Sun).[/dim]"
+        )
+        sys.exit(1)
+    except RuntimeError as exc:
+        console.print(f"[red]✘ {exc}[/red]")
+        sys.exit(1)
 
 
 @cli.command()

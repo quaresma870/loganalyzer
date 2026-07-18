@@ -31,3 +31,90 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run tests
         run: pytest tests/ -v --tb=short
+
+  build:
+    name: Build package
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install build twine
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Check package metadata
+        run: twine check dist/*
+      - name: Install built wheel (with all extras) in a clean venv
+        run: |
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install "$(echo dist/*.whl)[geoip,dashboard]"
+          /tmp/smoke-venv/bin/loganalyzer --version
+          /tmp/smoke-venv/bin/loganalyzer --help
+
+      - name: "Integration test: real commands against the real installed wheel"
+        # This job exists specifically because none of this repo's CI
+        # ever built or pip-installed the package before — only ever
+        # ran tests against the dev source tree via `pip install -r
+        # requirements.txt`. That gap is exactly what let a real,
+        # severe bug ship silently: pyproject.toml's build-backend was
+        # "setuptools.backends.legacy:build" — not a real, importable
+        # module — meaning `pip install .` and `python -m build` had
+        # NEVER worked for this project, ever, until this was found and
+        # fixed via a real clean-venv install, not from reading the
+        # config.
+        run: |
+          set -euo pipefail
+          LA=/tmp/smoke-venv/bin/loganalyzer
+          WORK=$(mktemp -d)
+          cd "$WORK"
+
+          echo "::group::list-parsers"
+          $LA list-parsers
+          echo "::endgroup::"
+
+          echo "::group::analyze a real log file"
+          cat > access.log << 'EOF'
+          192.168.1.10 - - [15/Jan/2026:10:00:01 +0000] "GET /index.html HTTP/1.1" 200 1234 "-" "Mozilla/5.0"
+          203.0.113.5 - - [15/Jan/2026:10:00:05 +0000] "GET /wp-login.php HTTP/1.1" 404 512 "-" "curl/7.0"
+          203.0.113.5 - - [15/Jan/2026:10:00:06 +0000] "GET /.env HTTP/1.1" 404 512 "-" "curl/7.0"
+          203.0.113.5 - - [15/Jan/2026:10:00:07 +0000] "GET /phpmyadmin HTTP/1.1" 404 512 "-" "curl/7.0"
+          EOF
+          OUTPUT=$($LA analyze access.log)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "scanner_detected" || (echo "expected scanner_detected anomaly not found" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::analyze --output/--json/--db"
+          $LA analyze access.log --output report.html
+          test -s report.html
+          $LA analyze access.log --json results.json
+          python3 -c "import json; json.load(open('results.json'))"
+          $LA analyze access.log --db results.db
+          $LA history results.db
+          echo "::endgroup::"
+
+          echo "::group::schedule — would have caught the *_/0_* hang and the out-of-range traceback bugs"
+          OUTPUT=$(timeout 8 $LA schedule access.log --cron "0 6 * * 1" 2>&1 || true)
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -qi "traceback"; then
+            echo "schedule crashed with a raw traceback -- regression"
+            exit 1
+          fi
+          echo "$OUTPUT" | grep -q "Scheduled run #1" || (echo "schedule's immediate run never completed" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::serve — real HTTP requests against the running dashboard"
+          $LA serve --db results.db --port 8123 &
+          SERVE_PID=$!
+          sleep 2
+          curl -sf http://127.0.0.1:8123/ -o /dev/null
+          curl -sf http://127.0.0.1:8123/api/runs -o /tmp/runs.json
+          python3 -c "import json; data = json.load(open('/tmp/runs.json')); assert len(data) > 0, 'no runs returned'"
+          kill $SERVE_PID
+          wait $SERVE_PID 2>/dev/null || true
+          echo "::endgroup::"
+
+          echo "All integration checks passed."
