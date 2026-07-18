@@ -3,6 +3,35 @@
 All notable changes to this project are documented here. See the
 [README](README.md) for current features and usage.
 
+### v1.1.1
+- fix: **`pyproject.toml`'s `build-backend` was never a real, importable module** — `pip install .`
+  and `python -m build` had never worked for this project, ever. Nobody noticed because the README's
+  own documented install path never exercised pip's packaging machinery, and CI never built or
+  pip-installed the package either. Fixed to the standard `setuptools.build_meta`.
+- fix: **`schedule --cron "*/0 * * * *"` hangs the process indefinitely** — a real, reproduced
+  denial-of-service, the same critical bug already found and fixed in the sibling secureaudit and
+  redteam-toolkit repos (a third, independent implementation of the same cron-parsing pattern).
+- fix: **out-of-range `--cron` hour/minute values produced a raw, unhandled traceback** —
+  `schedule.ScheduleValueError` isn't a subclass of `ValueError`, and the CLI had no error handling
+  around the scheduler at all.
+- fix: **`schedule` and `requests` were both undeclared core dependencies** — present in
+  `requirements.txt` but never in `pyproject.toml`, meaning a real `pip install loganalyzer` would
+  never install either, breaking the `schedule` command and `--geo` respectively.
+- fix: **`--geo` silently failed in every possible way** — a missing `requests` package, a network
+  failure, or a non-200 API response all produced a report with no Geo section and zero indication
+  anything had gone wrong. Confirmed real via an actual minimal `pip install loganalyzer` against
+  real public IPs. Now surfaces exactly why geo lookup produced nothing, in terminal, HTML, and JSON
+  output alike.
+- feat: **new CI "Build package" job** — builds the real wheel, installs it with all extras in a
+  clean venv, and runs every documented command against the real installed CLI. Exists specifically
+  because no CI job here had ever built or pip-installed the package before — exactly the gap that
+  let the build-backend bug ship undetected indefinitely.
+- test: 20+ new/updated tests, including full coverage of the previously entirely-untested live geo
+  lookup path, and a `pytest-timeout` safety net on the scheduler's zero-interval tests after
+  watching a deliberately-reintroduced regression genuinely hang real CI during verification.
+- docs: README documents the real `pip install .` path (works for the first time); test count
+  corrected (71 → 86); new `TestDocumentationFreshness` check to prevent that drift recurring.
+
 ### v1.1.0
 - feat: **read-only web dashboard** (`loganalyzer serve --db results.db`, optional
   `pip install loganalyzer[dashboard]` extra) — browse analysis run history saved via

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loganalyzer"
-version = "1.1.0"
+version = "1.1.1"
 description = "Parse, analyse and report on log files"
 requires-python = ">=3.11"
 dependencies = ["click>=8.1.0", "rich>=13.7.0", "pyyaml>=6.0.1", "schedule>=1.2.0", "requests>=2.31.0"]
