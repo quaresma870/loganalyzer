@@ -9,6 +9,7 @@ uvicorn>=0.29.0         # optional: web dashboard server
 # Dev / test
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
+pytest-timeout>=2.3.0        # safety net for scheduler tests — see TestScheduler
 ruff>=0.4.0
 httpx2>=2.0.0          # required by starlette.testclient (FastAPI TestClient) — see TestDashboard
 

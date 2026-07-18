@@ -368,7 +368,8 @@ class TestOfflineGeoIP:
 
     def test_offline_lookup_returns_known_city(self):
         analyzer = LogAnalyzer(enable_geo=True, geo_db_path=self.DB_PATH)
-        results = analyzer._lookup_geo_offline([self.KNOWN_IP], self.DB_PATH)
+        results, error = analyzer._lookup_geo_offline([self.KNOWN_IP], self.DB_PATH)
+        assert error is None
         assert len(results) == 1
         assert results[0]["ip"] == self.KNOWN_IP
         assert results[0]["country"] == "United Kingdom"
@@ -377,20 +378,29 @@ class TestOfflineGeoIP:
 
     def test_private_ips_skipped(self):
         analyzer = LogAnalyzer(enable_geo=True, geo_db_path=self.DB_PATH)
-        results = analyzer._lookup_geo_offline(["10.0.0.1", "192.168.1.1", "127.0.0.1"], self.DB_PATH)
+        results, error = analyzer._lookup_geo_offline(["10.0.0.1", "192.168.1.1", "127.0.0.1"], self.DB_PATH)
         assert results == []
+        assert error is None  # legitimately nothing to look up, not a failure
 
     def test_unknown_ip_skipped_gracefully(self):
         """An IP not present in the test DB must not raise — AddressNotFoundError
         is caught and the IP is simply omitted from results."""
         analyzer = LogAnalyzer(enable_geo=True, geo_db_path=self.DB_PATH)
-        results = analyzer._lookup_geo_offline(["203.0.113.99"], self.DB_PATH)
+        results, error = analyzer._lookup_geo_offline(["203.0.113.99"], self.DB_PATH)
         assert results == []
+        assert error is None
 
     def test_invalid_db_path_degrades_gracefully(self):
+        """Regression test, strengthened as part of the fix for a real,
+        reproduced bug: this used to silently return [] with no
+        indication anything went wrong — now returns a clear reason,
+        since "bad --geo-db path" and "no IPs to look up" used to look
+        identical to the user (both an empty, unexplained Geo section)."""
         analyzer = LogAnalyzer(enable_geo=True, geo_db_path="/nonexistent/path.mmdb")
-        results = analyzer._lookup_geo_offline([self.KNOWN_IP], "/nonexistent/path.mmdb")
+        results, error = analyzer._lookup_geo_offline([self.KNOWN_IP], "/nonexistent/path.mmdb")
         assert results == []
+        assert error is not None
+        assert "/nonexistent/path.mmdb" in error
 
     def test_full_analyze_uses_offline_path_when_configured(self):
         """End-to-end: analyze() with geo_db_path set populates result.geo
@@ -403,6 +413,7 @@ class TestOfflineGeoIP:
         result = analyzer.analyze(entries)
         assert len(result.geo) == 1
         assert result.geo[0]["country_code"] == "GB"
+        assert result.geo_error is None
 
     def test_offline_path_not_capped_to_top_20(self):
         """The live API path caps lookups to the top 20 IPs to respect
@@ -420,9 +431,12 @@ class TestOfflineGeoIP:
         assert len(result.geo) >= 1
 
     def test_geo_empty_without_geoip2_installed(self):
-        """If geoip2 isn't installed, this must degrade to an empty result,
-        not crash the whole analysis — confirms the optional-dependency
-        promise actually holds."""
+        """Regression test, strengthened as part of the fix for a real,
+        reproduced bug: if geoip2 isn't installed, this must degrade to
+        an empty result with a CLEAR reason — not crash the whole
+        analysis, but also not silently produce nothing with zero
+        explanation, which is what this used to do before geo_error
+        existed."""
         import builtins
         real_import = builtins.__import__
 
@@ -434,13 +448,114 @@ class TestOfflineGeoIP:
         analyzer = LogAnalyzer(enable_geo=True, geo_db_path=self.DB_PATH)
         builtins.__import__ = fake_import
         try:
-            results = analyzer._lookup_geo_offline([self.KNOWN_IP], self.DB_PATH)
+            results, error = analyzer._lookup_geo_offline([self.KNOWN_IP], self.DB_PATH)
         finally:
             builtins.__import__ = real_import
         assert results == []
+        assert error is not None
+        assert "geoip2" in error
 
 
 # ── LogEntry helpers ──────────────────────────────────────────────────────────
+
+# ── Live GeoIP (previously entirely untested — the exact gap that let a
+# real, silent-failure bug ship: --geo depended on `requests`, which
+# wasn't declared anywhere in pyproject.toml, and any failure — missing
+# package, network error, non-200 response — silently produced an empty
+# Geo section with zero indication anything had gone wrong) ────────────
+
+class TestLiveGeoIP:
+    KNOWN_IP = "8.8.8.8"
+
+    def test_missing_requests_package_reports_clear_reason(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "requests":
+                raise ImportError("simulated: requests not installed")
+            return real_import(name, *args, **kwargs)
+
+        analyzer = LogAnalyzer(enable_geo=True)
+        builtins.__import__ = fake_import
+        try:
+            results, error = analyzer._lookup_geo([self.KNOWN_IP])
+        finally:
+            builtins.__import__ = real_import
+        assert results == []
+        assert error is not None
+        assert "requests" in error
+
+    def test_only_private_ips_is_not_an_error(self):
+        """No public IPs to look up is a legitimate, silent no-op — not
+        a failure worth surfacing an error message for."""
+        analyzer = LogAnalyzer(enable_geo=True)
+        results, error = analyzer._lookup_geo(["192.168.1.1", "10.0.0.1", "127.0.0.1"])
+        assert results == []
+        assert error is None
+
+    def test_network_failure_reports_clear_reason(self):
+        """Regression test for the core bug: a network-level failure
+        (DNS, connection refused, timeout) used to be caught by a bare
+        `except Exception: pass` and silently produce []. Confirmed this
+        was real by running --geo through a real, minimal pip install
+        against real public IPs and observing a report with no Geo
+        section and no error of any kind, before fixing it."""
+        import unittest.mock as mock
+
+        import requests
+
+        analyzer = LogAnalyzer(enable_geo=True)
+        with mock.patch("requests.post", side_effect=requests.exceptions.ConnectionError("simulated: connection refused")):
+            results, error = analyzer._lookup_geo([self.KNOWN_IP])
+        assert results == []
+        assert error is not None
+        assert "ip-api.com" in error
+
+    def test_non_200_response_reports_status_code(self):
+        import unittest.mock as mock
+
+        analyzer = LogAnalyzer(enable_geo=True)
+        fake_response = mock.Mock(status_code=403)
+        with mock.patch("requests.post", return_value=fake_response):
+            results, error = analyzer._lookup_geo([self.KNOWN_IP])
+        assert results == []
+        assert error is not None
+        assert "403" in error
+
+    def test_successful_lookup_returns_results_with_no_error(self):
+        import unittest.mock as mock
+
+        analyzer = LogAnalyzer(enable_geo=True)
+        fake_response = mock.Mock(status_code=200)
+        fake_response.json.return_value = [
+            {"status": "success", "query": self.KNOWN_IP, "country": "United States",
+             "countryCode": "US", "city": "Mountain View", "isp": "Google LLC"}
+        ]
+        with mock.patch("requests.post", return_value=fake_response):
+            results, error = analyzer._lookup_geo([self.KNOWN_IP])
+        assert error is None
+        assert len(results) == 1
+        assert results[0]["ip"] == self.KNOWN_IP
+        assert results[0]["country_code"] == "US"
+
+    def test_all_lookups_failing_status_reports_clear_reason(self):
+        """A 200 response where every individual IP's own lookup status
+        is 'fail' (not the HTTP status) is a distinct case from a
+        network/HTTP-level failure — also worth a clear reason rather
+        than a silently empty result."""
+        import unittest.mock as mock
+
+        analyzer = LogAnalyzer(enable_geo=True)
+        fake_response = mock.Mock(status_code=200)
+        fake_response.json.return_value = [
+            {"status": "fail", "query": self.KNOWN_IP, "message": "reserved range"}
+        ]
+        with mock.patch("requests.post", return_value=fake_response):
+            results, error = analyzer._lookup_geo([self.KNOWN_IP])
+        assert results == []
+        assert error is not None
+
 
 class TestLogEntry:
     def test_is_error_by_status(self):
@@ -708,6 +823,94 @@ class TestScheduler:
         with pytest.raises((ValueError, RuntimeError)):
             _parse_cron_to_schedule("invalid", lambda: None)
 
+    def test_out_of_range_minute_raises_clean_value_error(self):
+        """Regression test for a real, reproduced bug: minute=60 passes
+        isdigit() (a valid digit string) but is out of the valid 0-59
+        range. Previously reached the `schedule` library's own .at()
+        call, which raises schedule.ScheduleValueError — NOT a subclass
+        of ValueError — producing a raw, unhandled traceback through the
+        real installed CLI instead of a clean error. Found by auditing
+        the sibling secureaudit and redteam-toolkit repos' identical,
+        already-fixed bug and checking whether this module — a third
+        independent implementation of the same cron-parsing pattern —
+        still had it unfixed. It did."""
+        import pytest
+        import schedule
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        schedule.clear()
+        try:
+            with pytest.raises(ValueError, match="Invalid minute: 60"):
+                _parse_cron_to_schedule("60 0 * * *", lambda: None)
+        finally:
+            schedule.clear()
+
+    def test_out_of_range_hour_raises_clean_value_error(self):
+        import pytest
+        import schedule
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        schedule.clear()
+        try:
+            with pytest.raises(ValueError, match="Invalid hour: 25"):
+                _parse_cron_to_schedule("0 25 * * *", lambda: None)
+        finally:
+            schedule.clear()
+
+    @pytest.mark.timeout(10)
+    def test_zero_minute_interval_raises_instead_of_hanging(self):
+        """Regression test for a real, reproduced, and much more serious
+        bug than the traceback ones: `*/0 * * * *` (an easy typo of
+        `*/30` losing a digit) doesn't raise ANYTHING when passed to
+        schedule.every(0).minutes — it hangs the process indefinitely
+        inside the schedule library's own internal next-run computation,
+        a genuine denial-of-service. Confirmed by actually letting this
+        run in a real terminal until it needed to be killed with a
+        timeout, not assumed as a risk from reading the code."""
+        import pytest
+        import schedule
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        schedule.clear()
+        try:
+            with pytest.raises(ValueError, match="minute interval.*must be a positive integer"):
+                _parse_cron_to_schedule("*/0 * * * *", lambda: None)
+        finally:
+            schedule.clear()
+
+    @pytest.mark.timeout(10)
+    def test_zero_hour_interval_raises_instead_of_hanging(self):
+        import pytest
+        import schedule
+
+        from loganalyzer.scheduler import _parse_cron_to_schedule
+        schedule.clear()
+        try:
+            with pytest.raises(ValueError, match="hour interval.*must be a positive integer"):
+                _parse_cron_to_schedule("0 */0 * * *", lambda: None)
+        finally:
+            schedule.clear()
+
+
+class TestScheduleCLIErrorHandling:
+    """The CLI-level wrapping of _parse_cron_to_schedule's errors —
+    confirms the real `schedule` command shows a clean message and
+    exits non-zero, rather than a raw traceback, for an invalid --cron
+    value."""
+
+    def test_invalid_cron_shows_clean_error_not_traceback(self, tmp_path):
+        from click.testing import CliRunner
+
+        from loganalyzer.cli import cli
+        log = tmp_path / "access.log"
+        log.write_text('192.168.1.1 - - [15/Jan/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 100\n')
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["schedule", str(log), "--cron", "60 0 * * *"])
+        assert result.exit_code == 1
+        assert "Invalid --cron expression" in result.output
+        assert "Traceback" not in result.output
+
 
 # ── CLI (regression coverage — previously zero) ──────────────────────────────
 #
@@ -893,3 +1096,83 @@ class TestDashboard:
         client = self.TestClient(self.create_app(str(db_path)))
         r = client.get("/")
         assert r.status_code == 200
+
+
+class TestPackagingCorrectness:
+    """Regression tests for a real, severe bug: pyproject.toml's
+    build-backend was 'setuptools.backends.legacy:build' — not a real,
+    importable module — meaning `pip install .` and `python -m build`
+    had NEVER worked for this project, ever, since this file was
+    written. Confirmed by actually running both commands against a
+    clean venv and hitting a real BackendUnavailable error before
+    fixing it, not assumed from reading the config alone. Nobody had
+    noticed because the README's own documented install path (`git
+    clone` + `pip install -r requirements.txt`, running via
+    `python -m loganalyzer.cli`) never actually exercises pip's
+    packaging machinery at all.
+
+    Also regression tests for two real, separate missing-dependency
+    bugs found during the same investigation: `schedule` (needed by
+    the `schedule` CLI command) and `requests` (needed by `--geo`)
+    were both present in requirements.txt but absent from
+    pyproject.toml's dependencies — meaning a real `pip install
+    loganalyzer` would never install either, no matter which
+    documented extras were requested."""
+
+    def _pyproject_text(self) -> str:
+        from pathlib import Path
+        return (Path(__file__).parent.parent / "pyproject.toml").read_text()
+
+    def test_build_backend_is_a_real_importable_module(self):
+        import importlib
+        import re
+
+        text = self._pyproject_text()
+        match = re.search(r'build-backend\s*=\s*"([^"]+)"', text)
+        assert match, "no build-backend found in pyproject.toml"
+        backend = match.group(1)
+        module_path = backend.split(":")[0]
+        # This is the actual regression check: the module named in
+        # build-backend must be real and importable, not just present
+        # as a string. The original bug's module name looked plausible
+        # (setuptools.backends.legacy) but was never a real path.
+        importlib.import_module(module_path)
+
+    def test_schedule_dependency_declared(self):
+        text = self._pyproject_text()
+        assert "schedule" in text.split("dependencies")[1].split("]")[0]
+
+    def test_requests_dependency_declared(self):
+        text = self._pyproject_text()
+        assert "requests" in text.split("dependencies")[1].split("]")[0]
+
+
+class TestDocumentationFreshness:
+    """Confirms the README's stated test count matches reality — the
+    same repeated drift already found and fixed in the sibling
+    secureaudit (#32) and redteam-toolkit (#45) repos. A test failing
+    here means someone added a test without updating the README."""
+
+    def test_readme_test_count_matches_reality(self):
+        import re
+        import subprocess
+        from pathlib import Path
+
+        result = subprocess.run(
+            ["python3", "-m", "pytest", "tests/", "--collect-only", "-q", "--tb=no"],
+            cwd=Path(__file__).parent.parent,
+            capture_output=True, text=True,
+        )
+        match = re.search(r"(\d+) test[s]? collected", result.stdout)
+        assert match, f"Could not parse pytest collection output:\n{result.stdout}"
+        real_count = int(match.group(1))
+
+        readme = (Path(__file__).parent.parent / "README.md").read_text()
+        readme_match = re.search(r"\*\*(\d+) tests\*\*", readme)
+        assert readme_match, "README.md has no '**N tests**' line in the Features section"
+        readme_count = int(readme_match.group(1))
+
+        assert real_count == readme_count, (
+            f"README says {readme_count} tests, but pytest collects {real_count}. "
+            f"Update the README's test count to {real_count}."
+        )

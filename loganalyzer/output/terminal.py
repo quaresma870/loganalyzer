@@ -180,6 +180,14 @@ def print_summary(result: AnalysisResult, title: str = "Log Analysis Report") ->
             t.add_row(g["ip"], f"{g.get('country_code', '')} {g.get('country', '')}",
                       g.get("city", ""), g.get("isp", ""))
         console.print(t)
+    elif result.geo_error:
+        # Geo was requested (--geo or --geo-db) but produced nothing —
+        # this branch exists specifically so that's never silent. Before
+        # it existed, a missing 'requests'/'geoip2' package, a network
+        # failure, or a bad --geo-db path all looked identical to the
+        # user: the Geo section just didn't appear, with no indication
+        # anything had gone wrong at all.
+        console.print(f"[yellow]⚠ IP geolocation unavailable: {result.geo_error}[/yellow]")
 
     console.rule("[dim]End of report[/dim]")
     console.print()

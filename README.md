@@ -21,7 +21,7 @@ Parse, analyse and report on log files from the command line. Supports multiple 
 - ✅ **Watch mode** — real-time tail with `--watch`
 - ✅ **Web dashboard** — read-only history viewer (`loganalyzer serve --db results.db`), optional extra
 - ✅ **Custom parser** — define any log format via a YAML regex config
-- ✅ **71 tests** — parsers, analyzers, and CLI command coverage
+- ✅ **86 tests** — parsers, analyzers, and CLI command coverage
 
 ---
 
@@ -30,8 +30,21 @@ Parse, analyse and report on log files from the command line. Supports multiple 
 ```bash
 git clone https://github.com/quaresma870/loganalyzer.git
 cd loganalyzer
+
+# Option A: install as a real package (recommended) — gives you the
+# `loganalyzer` command directly, no PYTHONPATH/module-invocation needed
+pip install .
+# with optional extras:
+pip install ".[geoip,dashboard]"
+
+# Option B: run from source without installing
 pip install -r requirements.txt
+# then invoke as: python -m loganalyzer.cli ...
 ```
+
+Every example below uses `python -m loganalyzer.cli` for portability (works
+either way), but if you installed via Option A, the plain `loganalyzer`
+command works identically — e.g. `loganalyzer analyze access.log`.
 
 ---
 
@@ -193,7 +206,7 @@ loganalyzer/
 │       ├── json_output.py  # JSON serialiser
 │       └── html_output.py  # Self-contained HTML with Chart.js
 ├── tests/
-│   ├── test_loganalyzer.py # 71 tests — parsers, analyzers, CLI, dashboard
+│   ├── test_loganalyzer.py # 86 tests — parsers, analyzers, CLI, dashboard
 │   └── fixtures/
 │       └── GeoLite2-City-Test.mmdb  # MaxMind's own test DB, Apache/MIT licensed
 ├── .github/workflows/ci.yml

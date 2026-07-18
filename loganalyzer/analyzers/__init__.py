@@ -46,6 +46,7 @@ class AnalysisResult:
 
     # Geo
     geo: list[dict] = field(default_factory=list)
+    geo_error: str | None = None
 
     # Fail2ban
     banned_ips: list[tuple[str, int]] = field(default_factory=list)
@@ -167,9 +168,11 @@ class LogAnalyzer:
         # otherwise the live ip-api.com lookup, requires network)
         if self.enable_geo:
             if self.geo_db_path:
-                result.geo = self._lookup_geo_offline([ip for ip, _ in result.top_ips], self.geo_db_path)
+                result.geo, result.geo_error = self._lookup_geo_offline(
+                    [ip for ip, _ in result.top_ips], self.geo_db_path
+                )
             else:
-                result.geo = self._lookup_geo([ip for ip, _ in result.top_ips[:20]])
+                result.geo, result.geo_error = self._lookup_geo([ip for ip, _ in result.top_ips[:20]])
 
         return result
 
@@ -372,7 +375,7 @@ class LogAnalyzer:
 
         return [{"time": k, **v} for k, v in sorted(buckets.items())]
 
-    def _lookup_geo_offline(self, ips: list[str], db_path: str) -> list[dict]:
+    def _lookup_geo_offline(self, ips: list[str], db_path: str) -> tuple[list[dict], str | None]:
         """Lookup geo info for IPs using a local MaxMind GeoLite2-City.mmdb
         file — no network call, no per-request rate limit, no IPs sent to
         a third party, and not capped to the top 20 the live API path uses
@@ -380,20 +383,24 @@ class LogAnalyzer:
 
         Get the free database (requires a free MaxMind account, no
         payment): https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+
+        Returns (results, error_reason) — same convention as
+        _lookup_geo(), for the same reason: a silently-empty Geo section
+        gives the user no way to tell "no public IPs in this log" apart
+        from "the geoip2 package isn't installed" or "the db path given
+        via --geo-db is wrong."
         """
         try:
             import geoip2.database
             import geoip2.errors
         except ImportError:
-            return []
+            return [], "the 'geoip2' package is not installed (pip install loganalyzer[geoip])"
 
         results = []
         try:
             reader = geoip2.database.Reader(db_path)
-        except Exception:
-            # Bad path / corrupt file — degrade gracefully rather than
-            # crashing the whole analysis over an optional enrichment step.
-            return []
+        except Exception as exc:
+            return [], f"could not open GeoLite2 database at {db_path!r}: {exc}"
 
         try:
             for ip in ips:
@@ -421,14 +428,26 @@ class LogAnalyzer:
         finally:
             reader.close()
 
-        return results
+        return results, None
 
-    def _lookup_geo(self, ips: list[str]) -> list[dict]:
-        """Lookup geo info for IPs using ip-api.com (free, no key needed)."""
+    def _lookup_geo(self, ips: list[str]) -> tuple[list[dict], str | None]:
+        """Lookup geo info for IPs using ip-api.com (free, no key needed).
+        Returns (results, error_reason) — error_reason is None on success
+        (including the legitimate case of no public IPs to look up), and
+        a short human-readable string on any failure, so the caller can
+        tell the user WHY the Geo section is empty instead of it just
+        silently not appearing.
+
+        Confirmed this silent-failure gap was real, not theoretical,
+        before fixing it: ran --geo through a real minimal `pip install`
+        (no extras — requests wasn't even guaranteed to be installed,
+        see the pyproject.toml fix alongside this one) against real
+        public IPs and got a report with no Geo section and no error of
+        any kind."""
         try:
             import requests
         except ImportError:
-            return []
+            return [], "the 'requests' package is not installed (needed for live --geo lookups)"
 
         results = []
         # Filter out private IPs
@@ -442,7 +461,7 @@ class LogAnalyzer:
                 continue
 
         if not public_ips:
-            return []
+            return [], None
 
         # Batch API (max 100 per request)
         try:
@@ -451,17 +470,22 @@ class LogAnalyzer:
                 json=[{"query": ip, "fields": "status,country,countryCode,city,isp,query"} for ip in public_ips[:100]],
                 timeout=10,
             )
-            if resp.status_code == 200:
-                for item in resp.json():
-                    if item.get("status") == "success":
-                        results.append({
-                            "ip": item["query"],
-                            "country": item.get("country"),
-                            "country_code": item.get("countryCode"),
-                            "city": item.get("city"),
-                            "isp": item.get("isp"),
-                        })
-        except Exception:
-            pass
+        except requests.exceptions.RequestException as exc:
+            return [], f"ip-api.com request failed: {exc}"
 
-        return results
+        if resp.status_code != 200:
+            return [], f"ip-api.com returned HTTP {resp.status_code}"
+
+        for item in resp.json():
+            if item.get("status") == "success":
+                results.append({
+                    "ip": item["query"],
+                    "country": item.get("country"),
+                    "country_code": item.get("countryCode"),
+                    "city": item.get("city"),
+                    "isp": item.get("isp"),
+                })
+
+        if not results:
+            return [], "ip-api.com returned no successful lookups for any of the queried IPs"
+        return results, None
